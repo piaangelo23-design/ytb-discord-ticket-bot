@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 import discord
+import aiohttp
 import requests
 from aiohttp import web
 from discord import app_commands
@@ -472,7 +473,34 @@ if __name__ == "__main__":
     async def main() -> None:
         health_runner = await start_health_server()
         try:
-            await bot.start(TOKEN)
+            # Keep the web health endpoint alive while Discord applies a temporary
+            # global rate limit. This prevents Render from repeatedly restarting
+            # the service and creating another burst of login requests.
+            retry_delay = 30
+            while True:
+                try:
+                    await bot.start(TOKEN)
+                    break
+                except discord.LoginFailure:
+                    log.exception("Discord rejected the bot token; refusing to retry an invalid token.")
+                    raise
+                except discord.HTTPException as exc:
+                    if exc.status != 429:
+                        log.exception("Discord HTTP error while starting the bot; retrying in %ss.", retry_delay)
+                    else:
+                        retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+                        try:
+                            retry_delay = max(retry_delay, int(float(retry_after))) if retry_after else retry_delay
+                        except (TypeError, ValueError):
+                            pass
+                        log.warning("Discord rate limit (429) during startup; retrying in %ss.", retry_delay)
+                except (aiohttp.ClientError, OSError):
+                    log.exception("Transient network error while starting the bot; retrying in %ss.", retry_delay)
+                finally:
+                    if not bot.is_closed():
+                        await bot.close()
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 300)
         finally:
             await health_runner.cleanup()
 
